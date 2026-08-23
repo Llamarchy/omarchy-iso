@@ -1,0 +1,16 @@
+alsa-firmware
+base
+base-devel
+btrfs-progs
+efibootmgr
+grub
+linux-firmware
+linux-aarch64
+omarchy-keyring
+openssh
+pipewire
+qemu-guest-agent
+snapper
+sof-firmware
+spice-vdagent
+wayland-vdagent-llamarchy

@@ -1,5 +1,29 @@
 # Omarchy ISO
 
+## Native ARM offline installer
+
+This fork adds the missing clean-install path for Omarchy 4 on AArch64 UEFI virtual machines. The upstream ISO and package mirror are x86_64-only, while the maintained Apple-Silicon release publishes a signed package bundle rather than a bootable installer. The ARM build combines the immutable `4.0.0-mac.10` runtime bundle, compatibility packages built natively from pinned sources, current Arch Linux ARM packages, the Llamarchy Wayland/SPICE resize agent, Voxtype, and its default English model into one bootable ISO.
+
+The resulting image boots natively in UTM, installs from its embedded pacman repository with the VM network disconnected, creates the configured user, installs GRUB at the standard removable AArch64 UEFI path, and starts Omarchy with dynamic Retina resizing. The persistent host cache remains the development input; each ISO receives a pruned, self-contained copy and has no runtime dependency on that cache.
+
+Build it through the reusable UTM builder:
+
+```bash
+./bin/omarchy-iso-make-arm-utm
+```
+
+The wrapper identifies the UTM builder by UUID and fixed MAC, resolves its current IPv4 lease from that MAC, and verifies the guest MAC, `llamarchy-arm-builder` hostname, and `aarch64` architecture before syncing any files. Run `./bin/omarchy-iso-make-arm-utm --check-builder` to exercise only this identity and transport gate.
+
+The image is written beneath `~/Library/Caches/Llamarchy/utm-arm/iso/release/`. The wrapper reuses cached Arch packages, signed release assets, Flutter artifacts, native package builds, Node.js, and ArchISO work state across builds.
+
+Validate the complete result in a fresh UTM VM with no network interface:
+
+```bash
+./bin/omarchy-iso-install-arm-utm
+```
+
+The acceptance command creates a blank native-AArch64 VM with no network interface, supplies installer answers through a CIDATA drive, observes the installer without allowing the live ISO to reboot back into itself, shuts the completed live environment down, removes all install media, boots the installed disk, and verifies the architecture, partitions, boot files, desktop services, Quickshell ABI, exact installed package set, Voxtype model and inference path, required runtime commands, and clean installation log.
+
 The Omarchy ISO is the only supported way to install Omarchy. It ships the Omarchy Configurator, installs Arch Linux, installs the Omarchy packages from the bundled mirror, runs target system setup in the chroot, creates the user, and runs `omarchy-setup-user` for that user.
 
 ## Downloading the latest ISO

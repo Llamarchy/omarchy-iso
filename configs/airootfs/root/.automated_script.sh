@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 #
 # Live ISO entry point on tty1: set up the live VT, run the configurator
 # wizard, then hand off to the Python install orchestrator. Mirrors the
@@ -9,6 +9,31 @@
 #   - CLICOLOR_FORCE/FORCE_COLOR so gum emits ANSI even with stdout piped
 #   - COLUMNS/LINES so gum picks up real terminal size
 set -euo pipefail
+
+read_auto_reboot() {
+  local config=$1
+
+  jq -r '
+    .omarchy_install as $install |
+    if (($install | type) == "object" and ($install | has("auto_reboot"))) then
+      $install.auto_reboot
+    else
+      true
+    end
+  ' "$config" 2>/dev/null || printf 'true\n'
+}
+
+# Keep the configuration parser directly testable without entering the live-ISO
+# tty flow. This uses the same function as the installer below.
+if [[ ${1:-} == "--read-auto-reboot" ]]; then
+  if (( $# == 2 )); then
+    read_auto_reboot "$2"
+    exit 0
+  else
+    echo "Usage: $0 --read-auto-reboot CONFIG" >&2
+    exit 2
+  fi
+fi
 
 [[ $(tty) == /dev/tty1 ]] || exit 0
 
@@ -110,17 +135,26 @@ if [[ -f /root/defer-provisioning ]] ||
   [[ "$(jq -r '.omarchy_install.defer_provisioning // false' /root/user_configuration.json 2>/dev/null)" == "true" ]]; then
   export OMARCHY_UI_DEFER_PROVISIONING=yes
 fi
+if [[ "$(read_auto_reboot /root/user_configuration.json)" == "false" ]]; then
+  export OMARCHY_UI_AUTO_REBOOT=no
+fi
 
 # The foreground dashboard is now the sole visible install UI owner. It starts
 # the actual installer as a non-interactive child, logs child output, waits for
 # completion, then renders the final installed-time/reboot prompt itself.
 export OMARCHY_DASHBOARD_TTY="$(tty)"
 rm -f /run/omarchy-install/state.json
+if [[ $(uname -m) == "aarch64" ]]; then
+  installer=/usr/local/bin/omarchy-arm-install
+else
+  installer=/usr/local/bin/omarchy-iso-install
+fi
+
 /usr/local/bin/omarchy-install-dashboard \
   "$OMARCHY_INSTALL_LOG_FILE" \
   /run/omarchy-install/state.json \
   -- \
-  /usr/local/bin/omarchy-iso-install \
+  "$installer" \
     --config /root/user_configuration.json \
     --creds /root/user_credentials.json \
     --full-name-file /root/user_full_name.txt \
@@ -129,3 +163,13 @@ rm -f /run/omarchy-install/state.json
     --authorized-keys-file /root/authorized_keys \
     --tailscale-authkey-file /root/tailscale_authkey \
     --defer-provisioning-file /root/defer-provisioning
+
+# A non-rebooting autoinstall is controlled by an external harness. Keep this
+# tty1 process alive after the dashboard writes its durable completion state;
+# exiting would make systemd respawn the autologin shell and start a second
+# destructive install from the still-attached ISO. The harness powers the live
+# environment off through the guest agent, which terminates this process.
+if [[ ${OMARCHY_UI_AUTO_REBOOT:-} == "no" ]]; then
+  echo "Installation complete; waiting for external shutdown."
+  exec sleep infinity
+fi

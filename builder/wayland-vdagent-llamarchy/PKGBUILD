@@ -1,0 +1,19 @@
+pkgname=wayland-vdagent-llamarchy
+pkgver=0.3.4
+pkgrel=1
+pkgdesc='Wayland-native SPICE resize and clipboard agent for Hyprland guests'
+arch=('aarch64')
+url='https://github.com/Llamarchy/wayland-vdagent'
+license=('MIT')
+depends=('glibc' 'spice-vdagent')
+provides=('wayland-vdagent')
+source=('wayland-vdagent-aarch64-linux' 'wayland-vdagent.service')
+sha256sums=('637f924c48a75afe11d673f33c664e95bb3540172f972ce5d3c597463ed45360'
+            'SKIP')
+
+package() {
+  install -Dm0755 "$srcdir/wayland-vdagent-aarch64-linux" "$pkgdir/usr/bin/wayland-vdagent"
+  install -Dm0644 "$srcdir/wayland-vdagent.service" "$pkgdir/usr/lib/systemd/user/wayland-vdagent.service"
+  install -d "$pkgdir/usr/lib/systemd/user/graphical-session.target.wants"
+  ln -s ../wayland-vdagent.service "$pkgdir/usr/lib/systemd/user/graphical-session.target.wants/wayland-vdagent.service"
+}

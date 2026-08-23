@@ -1,0 +1,23 @@
+pkgname=voxtype-bin
+pkgver=0.7.2
+pkgrel=1
+pkgdesc='Voxtype voice-to-text daemon, native AArch64 CPU build'
+arch=('aarch64')
+url='https://github.com/peteonrails/voxtype'
+license=('MIT')
+depends=('alsa-lib' 'pipewire-alsa' 'wl-clipboard' 'wtype')
+optdepends=('libnotify: desktop notifications' 'playerctl: pause media during recording')
+provides=('voxtype')
+conflicts=('voxtype')
+source=("voxtype-$pkgver-linux-aarch64-cpu::https://github.com/peteonrails/voxtype/releases/download/v$pkgver/voxtype-$pkgver-linux-aarch64-cpu"
+        "LICENSE::https://raw.githubusercontent.com/peteonrails/voxtype/v$pkgver/LICENSE"
+        'voxtype.service')
+sha256sums=('8cd203672a44a296844ab424121cf1d5b89c14e821d67f1c4e8278f9196fd96f'
+            '31123c45b4ff9cb5fd9e01083350fea6ccaf14969013fd48e4c95fdf89e6eb4b'
+            '31b94ce0f529937d67674ddbf685c55b0c4242df6ea5d546dda49801af93d6f5')
+
+package() {
+  install -Dm755 "$srcdir/voxtype-$pkgver-linux-aarch64-cpu" "$pkgdir/usr/bin/voxtype"
+  install -Dm644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "$srcdir/voxtype.service" "$pkgdir/usr/lib/systemd/user/voxtype.service"
+}

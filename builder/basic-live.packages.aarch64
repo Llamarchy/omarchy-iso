@@ -1,0 +1,16 @@
+arch-install-scripts
+archlinuxarm-keyring
+base
+dosfstools
+e2fsprogs
+gptfdisk
+grub
+linux-aarch64
+mkinitcpio
+mkinitcpio-archiso
+openssh
+parted
+pv
+qemu-guest-agent
+rsync
+sudo
