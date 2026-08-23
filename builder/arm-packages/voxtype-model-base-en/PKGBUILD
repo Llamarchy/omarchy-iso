@@ -1,0 +1,13 @@
+pkgname=voxtype-model-base-en
+pkgver=20231117
+pkgrel=1
+pkgdesc='Default English Whisper model for offline Voxtype dictation'
+arch=('any')
+url='https://huggingface.co/ggerganov/whisper.cpp'
+license=('MIT')
+source=('ggml-base.en.bin::https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin')
+sha256sums=('a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002')
+
+package() {
+  install -Dm644 "$srcdir/ggml-base.en.bin" "$pkgdir/usr/share/voxtype/models/ggml-base.en.bin"
+}

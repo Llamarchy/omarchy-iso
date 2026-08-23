@@ -6,8 +6,18 @@ NO_CACHE=""
 KEEP_PKG_CACHE=""
 LOCAL_OMARCHY_PATH=""
 LOCAL_PKGS_PATH=""
+OMARCHY_ARCH="${OMARCHY_ARCH:-x86_64}"
+NATIVE_CACHE=""
 while [[ $# -gt 0 ]]; do
   case $1 in
+  --arch)
+    OMARCHY_ARCH="${2:-}"
+    shift 2
+    ;;
+  --native-cache)
+    NATIVE_CACHE="${2:-}"
+    shift 2
+    ;;
   --no-cache)
     NO_CACHE=1
     shift
@@ -57,11 +67,16 @@ while [[ $# -gt 0 ]]; do
     ;;
   *)
     echo "Unknown option: $1"
-    echo "Usage: $0 [--no-cache] [--keep-pkg-cache] [--no-boot-offer] [--debug] [--edge] [--dev|--rc] [--local-source <omarchy-checkout> <pkgs-checkout>]"
+    echo "Usage: $0 [--arch x86_64|aarch64] [--native-cache <dir>] [--no-cache] [--keep-pkg-cache] [--no-boot-offer] [--debug] [--edge] [--dev|--rc] [--local-source <omarchy-checkout> <pkgs-checkout>]"
     exit 1
     ;;
   esac
 done
+
+if [[ $OMARCHY_ARCH != "x86_64" && $OMARCHY_ARCH != "aarch64" ]]; then
+  echo "Error: --arch must be x86_64 or aarch64" >&2
+  exit 1
+fi
 
 if [[ -n $LOCAL_OMARCHY_PATH ]]; then
   [[ -d $LOCAL_OMARCHY_PATH ]] || { echo "Error: Omarchy checkout not found at $LOCAL_OMARCHY_PATH" >&2; exit 1; }
@@ -74,6 +89,11 @@ lint_file_permissions() {
   local profiledef="configs/profiledef.sh"
   local -A declared=()
   local missing=()
+  local git_checkout=""
+
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git_checkout=1
+  fi
 
   while IFS= read -r path; do
     [[ -n $path ]] && declared["$path"]=1
@@ -84,7 +104,13 @@ lint_file_permissions() {
 
     local rel="${f#configs/airootfs}"
     local mode
-    mode=$(git ls-files --stage -- "$f" | awk '{print $1}')
+    if [[ -n $git_checkout ]]; then
+      mode=$(git ls-files --stage -- "$f" | awk '{print $1}')
+    elif [[ -x $f ]]; then
+      mode=100755
+    else
+      mode=100644
+    fi
 
     if [[ $mode != 100755 && $(head -c 2 "$f") != "#!" ]]; then
       continue
@@ -105,60 +131,96 @@ lint_file_permissions() {
 
 lint_file_permissions
 
-# Purging the host package cache needs interactive sudo; --keep-pkg-cache
-# skips it so unattended builds (test rigs, agents) can run without a prompt.
-if [[ -z $KEEP_PKG_CACHE ]]; then
-  sudo rm -rf /var/cache/pacman/pkg/*
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git submodule update --init --recursive --jobs=8
+elif [[ ! -x archiso/archiso/mkarchiso ]]; then
+  echo "Error: exported source tree does not contain the initialized ArchISO sources" >&2
+  exit 1
 fi
-git submodule update --init --recursive --jobs=8
 
 BUILD_SCRIPT="builder/build-iso.sh"
 BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
-BUILD_RELEASE_PATH="$BUILD_ROOT/release"
-mkdir -p "$BUILD_RELEASE_PATH"
-
 OMARCHY_ISO_REF="${OMARCHY_ISO_REF:-quattro}"
 OMARCHY_MIRROR="${OMARCHY_MIRROR:-stable}"
 
-DOCKER_ARGS=(
-  --rm
-  --privileged
-  -e "OMARCHY_ISO_REF=$OMARCHY_ISO_REF"
-  -e "OMARCHY_MIRROR=$OMARCHY_MIRROR"
-  -e "OMARCHY_INSTALL_DEBUG=${OMARCHY_INSTALL_DEBUG:-}"
-  -e "HOST_UID=$(id -u)"
-  -e "HOST_GID=$(id -g)"
-  -v "$BUILD_RELEASE_PATH/:/out/"
-  -v "$BUILD_ROOT/$BUILD_SCRIPT:/$BUILD_SCRIPT:ro"
-  -v "$BUILD_ROOT/archiso:/archiso:ro"
-  -v "$BUILD_ROOT/builder:/builder:ro"
-  -v "$BUILD_ROOT/configs:/configs:ro"
-)
+if [[ -n $NATIVE_CACHE ]]; then
+  if [[ $(uname -s) != "Linux" || $(uname -m) != "$OMARCHY_ARCH" ]]; then
+    echo "Error: --native-cache requires a native $OMARCHY_ARCH Linux builder" >&2
+    exit 1
+  fi
+  if (( EUID != 0 )); then
+    echo "Error: native ISO builds must run as root" >&2
+    exit 1
+  fi
+  NATIVE_CACHE=$(realpath "$NATIVE_CACHE")
+  BUILD_RELEASE_PATH="$NATIVE_CACHE/iso/release"
+  mkdir -p "$BUILD_RELEASE_PATH" "$NATIVE_CACHE/iso/build"
 
-if [[ -n $LOCAL_OMARCHY_PATH ]]; then
-  DOCKER_ARGS+=(
-    -v "$LOCAL_OMARCHY_PATH:/omarchy-source:ro"
-    -v "$LOCAL_PKGS_PATH:/omarchy-pkgs:ro"
-  )
-fi
-
-if [[ -d /var/cache/pacman/pkg ]]; then
-  DOCKER_ARGS+=(-v "/var/cache/pacman/pkg:/var/cache/pacman/pkg")
-fi
-
-# Mount the build cache directory where packages are downloaded. Channels use
-# different package snapshots and must never share an offline mirror cache.
-if [[ -z "$NO_CACHE" ]]; then
-  OFFLINE_REPO_BUILD_CACHE_DIR="$HOME/.cache/omarchy/iso_${OMARCHY_MIRROR}/airootfs/var/cache/omarchy"
-  mkdir -p "$OFFLINE_REPO_BUILD_CACHE_DIR"
-  DOCKER_ARGS+=(-v "$OFFLINE_REPO_BUILD_CACHE_DIR:/var/cache/airootfs/var/cache/omarchy")
+  OMARCHY_ARCH="$OMARCHY_ARCH" \
+    OMARCHY_ISO_REF="$OMARCHY_ISO_REF" \
+    OMARCHY_MIRROR="$OMARCHY_MIRROR" \
+    OMARCHY_INSTALL_DEBUG="${OMARCHY_INSTALL_DEBUG:-}" \
+    OMARCHY_ISO_SOURCE_ROOT="$BUILD_ROOT" \
+    OMARCHY_ARM_ARTIFACT_CACHE="$NATIVE_CACHE" \
+    ISO_BUILD_CACHE="$NATIVE_CACHE/iso/build" \
+    ISO_OUTPUT_DIR="$BUILD_RELEASE_PATH" \
+    bash "$BUILD_ROOT/$BUILD_SCRIPT"
 else
-  # The locally cached :latest image is a cache too — docker run never
-  # re-checks the registry for it, so refresh it when building cold.
-  DOCKER_ARGS+=(--pull=always)
-fi
+  if [[ $OMARCHY_ARCH == "aarch64" ]]; then
+    echo "Error: aarch64 builds use --native-cache on an Arch Linux ARM builder" >&2
+    exit 1
+  fi
 
-docker run "${DOCKER_ARGS[@]}" archlinux/archlinux:latest /$BUILD_SCRIPT
+  BUILD_RELEASE_PATH="$BUILD_ROOT/release"
+  mkdir -p "$BUILD_RELEASE_PATH"
+
+  # Purging the host package cache needs interactive sudo; --keep-pkg-cache
+  # skips it so unattended builds (test rigs, agents) can run without a prompt.
+  if [[ -z $KEEP_PKG_CACHE ]]; then
+    sudo rm -rf /var/cache/pacman/pkg/*
+  fi
+
+  DOCKER_ARGS=(
+    --rm
+    --privileged
+    -e "OMARCHY_ARCH=$OMARCHY_ARCH"
+    -e "OMARCHY_ISO_REF=$OMARCHY_ISO_REF"
+    -e "OMARCHY_MIRROR=$OMARCHY_MIRROR"
+    -e "OMARCHY_INSTALL_DEBUG=${OMARCHY_INSTALL_DEBUG:-}"
+    -e "HOST_UID=$(id -u)"
+    -e "HOST_GID=$(id -g)"
+    -v "$BUILD_RELEASE_PATH/:/out/"
+    -v "$BUILD_ROOT/$BUILD_SCRIPT:/$BUILD_SCRIPT:ro"
+    -v "$BUILD_ROOT/archiso:/archiso:ro"
+    -v "$BUILD_ROOT/builder:/builder:ro"
+    -v "$BUILD_ROOT/configs:/configs:ro"
+  )
+
+  if [[ -n $LOCAL_OMARCHY_PATH ]]; then
+    DOCKER_ARGS+=(
+      -v "$LOCAL_OMARCHY_PATH:/omarchy-source:ro"
+      -v "$LOCAL_PKGS_PATH:/omarchy-pkgs:ro"
+    )
+  fi
+
+  if [[ -d /var/cache/pacman/pkg ]]; then
+    DOCKER_ARGS+=(-v "/var/cache/pacman/pkg:/var/cache/pacman/pkg")
+  fi
+
+  # Mount the build cache directory where packages are downloaded. Channels use
+  # different package snapshots and must never share an offline mirror cache.
+  if [[ -z $NO_CACHE ]]; then
+    OFFLINE_REPO_BUILD_CACHE_DIR="$HOME/.cache/omarchy/iso_${OMARCHY_MIRROR}/airootfs/var/cache/omarchy"
+    mkdir -p "$OFFLINE_REPO_BUILD_CACHE_DIR"
+    DOCKER_ARGS+=(-v "$OFFLINE_REPO_BUILD_CACHE_DIR:/var/cache/airootfs/var/cache/omarchy")
+  else
+    # The locally cached :latest image is a cache too — docker run never
+    # re-checks the registry for it, so refresh it when building cold.
+    DOCKER_ARGS+=(--pull=always)
+  fi
+
+  docker run "${DOCKER_ARGS[@]}" archlinux/archlinux:latest /$BUILD_SCRIPT
+fi
 
 latest_iso=$(\ls -t "$BUILD_RELEASE_PATH"/*.iso | head -n1)
 iso_ref="${latest_iso%.*}-$OMARCHY_ISO_REF.iso"

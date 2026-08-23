@@ -1,0 +1,362 @@
+#!/bin/bash
+
+set -eEuo pipefail
+
+config=""
+creds=""
+full_name_file=""
+email_file=""
+authorized_keys_file=""
+
+while (($#)); do
+  case $1 in
+    --config) config="$2"; shift 2 ;;
+    --creds) creds="$2"; shift 2 ;;
+    --full-name-file) full_name_file="$2"; shift 2 ;;
+    --email-file) email_file="$2"; shift 2 ;;
+    --authorized-keys-file) authorized_keys_file="$2"; shift 2 ;;
+    --encrypt-file|--tailscale-authkey-file|--defer-provisioning-file) shift 2 ;;
+    *) echo "omarchy-arm-install: unknown arg $1" >&2; exit 2 ;;
+  esac
+done
+
+[[ $(uname -m) == "aarch64" ]] || { echo "ERROR: ARM installer requires aarch64" >&2; exit 1; }
+[[ -s $config && -s $creds ]] || { echo "ERROR: installer configuration is incomplete" >&2; exit 1; }
+[[ $(jq -r '.omarchy_install.mode // ""' "$config") == "full_disk" ]] || { echo "ERROR: the ARM image currently supports full-disk installation" >&2; exit 1; }
+[[ $(jq -r '.disk_config.disk_encryption // empty' "$config") == "" ]] || { echo "ERROR: select the unencrypted full-disk option for this ARM image" >&2; exit 1; }
+
+disk=$(jq -r '.disk_config.device_modifications[0].device // empty' "$config")
+username=$(jq -r '.users[0].username // empty' "$creds")
+password_hash=$(jq -r '.users[0].enc_password // empty' "$creds")
+hostname=$(jq -r '.hostname // "omarchy"' "$config")
+timezone=$(jq -r '.timezone // "UTC"' "$config")
+keyboard=$(jq -r '.locale_config.kb_layout // "us"' "$config")
+
+[[ $disk == /dev/* && -b $disk ]] || { echo "ERROR: selected install disk is unavailable: $disk" >&2; exit 1; }
+[[ $username =~ ^[a-z_][a-z0-9_-]{0,31}$ && $username != "root" ]] || { echo "ERROR: invalid username: $username" >&2; exit 1; }
+[[ $password_hash == '$6$'* || $password_hash == '$y$'* ]] || { echo "ERROR: unsupported password hash" >&2; exit 1; }
+[[ $hostname =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,62}$ ]] || { echo "ERROR: invalid hostname: $hostname" >&2; exit 1; }
+[[ -e /usr/share/zoneinfo/$timezone ]] || { echo "ERROR: invalid timezone: $timezone" >&2; exit 1; }
+
+partition_path() {
+  local device="$1"
+  local number="$2"
+
+  if [[ $device == *[0-9] ]]; then
+    printf '%sp%s\n' "$device" "$number"
+  else
+    printf '%s%s\n' "$device" "$number"
+  fi
+}
+
+install_started_at=$(date +%s)
+install_total_phases=5
+install_expected_packages=0
+install_finished_packages=0
+if [[ -r /usr/share/omarchy-iso/expected-packages ]]; then
+  read -r install_expected_packages _ </usr/share/omarchy-iso/expected-packages || install_expected_packages=0
+fi
+[[ $install_expected_packages =~ ^[0-9]+$ ]] || install_expected_packages=0
+
+write_state() {
+  local phase="$1" index finished_at=0 installed_packages=0 expected_packages=0
+  local state_file=/run/omarchy-install/state.json
+  local state_tmp=/run/omarchy-install/.state.json.tmp
+
+  case "$phase" in
+    "Preparing install target")  index=0 ;;
+    "Installing Arch + Omarchy") index=1 ;;
+    "Configuring system")        index=2 ;;
+    "Finalizing ARM boot")       index=3 ;;
+    "Validating boot setup")     index=4 ;;
+    "Installation complete")
+      index=4
+      finished_at=$(date +%s)
+      installed_packages=$install_finished_packages
+      expected_packages=$install_expected_packages
+      ;;
+    *)
+      echo "ERROR: unknown ARM install phase: $phase" >&2
+      return 1
+      ;;
+  esac
+
+  install -d -m 0755 /run/omarchy-install
+  jq -n \
+    --arg phase "$phase" \
+    --arg target /mnt \
+    --argjson started_at "$install_started_at" \
+    --argjson total_phases "$install_total_phases" \
+    --argjson current_index "$index" \
+    --argjson finished_at "$finished_at" \
+    --argjson installed_packages "$installed_packages" \
+    --argjson expected_packages "$expected_packages" \
+    '{
+      started_at: $started_at,
+      target: $target,
+      total_phases: $total_phases,
+      current_index: $current_index,
+      current_phase: $phase,
+      phases: []
+    } + if $finished_at > 0 then {
+      finished_at: $finished_at,
+      installed_packages: $installed_packages,
+      expected_packages: $expected_packages
+    } else {} end' >"$state_tmp"
+  mv "$state_tmp" "$state_file"
+}
+
+cleanup_mounts() {
+  umount -R /mnt 2>/dev/null || true
+  umount /mnt-btrfs 2>/dev/null || true
+}
+trap cleanup_mounts ERR
+
+write_state "Preparing install target"
+wipefs -af "$disk"
+parted --script "$disk" mklabel gpt
+parted --script "$disk" mkpart OMARCHY_EFI fat32 1MiB 1025MiB
+parted --script "$disk" set 1 esp on
+parted --script "$disk" mkpart OMARCHY_BOOT ext4 1025MiB 3073MiB
+parted --script "$disk" mkpart OMARCHY_ROOT btrfs 3073MiB 100%
+partprobe "$disk"
+udevadm settle
+
+efi_partition=$(partition_path "$disk" 1)
+boot_partition=$(partition_path "$disk" 2)
+root_partition=$(partition_path "$disk" 3)
+[[ -b $efi_partition && -b $boot_partition && -b $root_partition ]] || { echo "ERROR: target partitions did not appear" >&2; exit 1; }
+
+mkfs.fat -F32 -n OMARCHY_EFI "$efi_partition"
+mkfs.ext4 -F -L OMARCHY_BOOT "$boot_partition"
+mkfs.btrfs -f -L OMARCHY "$root_partition"
+mkdir -p /mnt-btrfs
+mount "$root_partition" /mnt-btrfs
+for subvolume in @ @home @log @pkg; do
+  btrfs subvolume create "/mnt-btrfs/$subvolume"
+done
+umount /mnt-btrfs
+
+mount -o noatime,compress=zstd,subvol=@ "$root_partition" /mnt
+mkdir -p /mnt/home /mnt/var/log /mnt/var/cache/pacman/pkg /mnt/boot
+mount -o noatime,compress=zstd,subvol=@home "$root_partition" /mnt/home
+mount -o noatime,compress=zstd,subvol=@log "$root_partition" /mnt/var/log
+mount -o noatime,compress=zstd,subvol=@pkg "$root_partition" /mnt/var/cache/pacman/pkg
+mount "$boot_partition" /mnt/boot
+mkdir -p /mnt/boot/efi
+mount "$efi_partition" /mnt/boot/efi
+mkdir -p /mnt/var/cache/omarchy/mirror/offline
+mount --bind /var/cache/omarchy/mirror/offline /mnt/var/cache/omarchy/mirror/offline
+
+write_state "Installing Arch + Omarchy"
+mapfile -t packages < <(
+  {
+    grep -hv '^#\|^$' /usr/share/omarchy-iso/archinstall.packages
+    grep -hv '^#\|^$' /usr/share/omarchy-iso/omarchy-base.packages
+    printf '%s\n' omarchy-dev omarchy-settings-dev omarchy-nvim wayland-vdagent-llamarchy
+  } | sort -u
+)
+# A few Arch package install hooks call vercmp while their transaction is still
+# being ordered. Seed its provider first so those hooks run cleanly regardless
+# of where pacman-contrib lands in the complete desktop transaction.
+pacstrap -C /etc/pacman.conf -K /mnt pacman-contrib
+pacstrap -C /etc/pacman.conf -K /mnt "${packages[@]}"
+genfstab -U /mnt >/mnt/etc/fstab
+
+node_archive=$(find /opt/packages -maxdepth 1 -type f -name 'node-v*-linux-arm64.tar.gz' -print -quit)
+[[ -s $node_archive ]] || { echo "ERROR: bundled ARM64 Node.js archive is unavailable" >&2; exit 1; }
+install -d -m 0755 /mnt/opt/packages
+install -m 0644 "$node_archive" "/mnt/opt/packages/${node_archive##*/}"
+
+# mac.10 introduced offline Node provisioning with an x64-specific archive
+# name. Select the architecture bundled by this native AArch64 image.
+mise_work=/mnt/usr/share/omarchy/install/user/mise-work.sh
+[[ -s $mise_work ]] || { echo "ERROR: Omarchy mise provisioning script is unavailable" >&2; exit 1; }
+sed -i 's/linux-x64/linux-arm64/g' "$mise_work"
+grep -Fq 'node-v*-linux-arm64.tar.gz' "$mise_work" || {
+  echo "ERROR: Omarchy mise provisioning is not configured for ARM64" >&2
+  exit 1
+}
+
+write_state "Configuring system"
+ln -sfn "/usr/share/zoneinfo/$timezone" /mnt/etc/localtime
+arch-chroot /mnt hwclock --systohc
+printf 'en_US.UTF-8 UTF-8\n' >/mnt/etc/locale.gen
+arch-chroot /mnt locale-gen
+printf 'LANG=en_US.UTF-8\n' >/mnt/etc/locale.conf
+printf 'KEYMAP=%s\n' "$keyboard" >/mnt/etc/vconsole.conf
+printf '%s\n' "$hostname" >/mnt/etc/hostname
+cat >/mnt/etc/hosts <<EOF
+127.0.0.1 localhost
+::1 localhost
+127.0.1.1 $hostname.localdomain $hostname
+EOF
+
+arch-chroot /mnt useradd --create-home --groups wheel --shell /bin/bash "$username"
+arch-chroot /mnt usermod --password "$password_hash" "$username"
+printf '%%wheel ALL=(ALL:ALL) ALL\n' >/mnt/etc/sudoers.d/10-omarchy-wheel
+chmod 0440 /mnt/etc/sudoers.d/10-omarchy-wheel
+
+install -d -m 0755 /mnt/var/lib/sddm
+cat >/mnt/var/lib/sddm/state.conf <<EOF
+[Last]
+Session=omarchy.desktop
+User=$username
+EOF
+target_sddm_uid=$(arch-chroot /mnt id -u sddm)
+target_sddm_gid=$(arch-chroot /mnt id -g sddm)
+chown "$target_sddm_uid:$target_sddm_gid" /mnt/var/lib/sddm /mnt/var/lib/sddm/state.conf
+
+cp /etc/pacman.conf /mnt/etc/pacman.conf
+install -d -m 0755 /mnt/usr/share/omarchy-iso
+install -m 0644 /usr/share/omarchy-iso/snapper-root /mnt/usr/share/omarchy-iso/snapper-root
+install -m 0644 /usr/share/omarchy-iso/target-packages /mnt/usr/share/omarchy-iso/target-packages
+install -m 0644 /usr/share/omarchy-iso/required-runtime-commands /mnt/usr/share/omarchy-iso/required-runtime-commands
+arch-chroot /mnt env \
+  OMARCHY_PATH=/usr/share/omarchy \
+  OMARCHY_INSTALL=/usr/share/omarchy/install \
+  OMARCHY_SNAPPER_TEMPLATE=/usr/share/omarchy-iso/snapper-root \
+  OMARCHY_SNAPPER_CONFIGURE_TEST=1 \
+  omarchy-apply-system --install-user "$username" --first-install
+arch-chroot /mnt systemctl disable snapper-timeline.timer snapper-cleanup.timer limine-snapper-sync.service 2>/dev/null || true
+
+target_home="/home/$username"
+arch-chroot /mnt runuser -u "$username" -- env \
+  --unset=XDG_RUNTIME_DIR \
+  --unset=DBUS_SESSION_BUS_ADDRESS \
+  HOME="$target_home" \
+  USER="$username" \
+  LOGNAME="$username" \
+  OMARCHY_PATH=/usr/share/omarchy \
+  OMARCHY_INSTALL=/usr/share/omarchy/install \
+  OMARCHY_SETUP_CONTEXT=iso-chroot \
+  PATH=/usr/share/omarchy/bin:/usr/local/sbin:/usr/local/bin:/usr/bin \
+  omarchy-provision-user --force --first-install
+
+# Voxtype is part of this offline image. Link its verified shared model into
+# the conventional per-user data directory and enable its user service before
+# the first graphical login, so dictation never enters a download/setup path.
+voxtype_model=/usr/share/voxtype/models/ggml-base.en.bin
+[[ -s /mnt$voxtype_model ]] || { echo "ERROR: bundled Voxtype model is unavailable" >&2; exit 1; }
+install -d -m 0755 "/mnt$target_home/.local/share/voxtype/models"
+ln -sfn "$voxtype_model" "/mnt$target_home/.local/share/voxtype/models/ggml-base.en.bin"
+install -d -m 0755 "/mnt$target_home/.config/voxtype"
+if [[ ! -s /mnt$target_home/.config/voxtype/config.toml ]]; then
+  install -m 0644 /mnt/usr/share/omarchy/default/voxtype/config.toml "/mnt$target_home/.config/voxtype/config.toml"
+fi
+install -d -m 0755 "/mnt$target_home/.config/systemd/user/graphical-session.target.wants"
+ln -sfn /usr/lib/systemd/user/voxtype.service \
+  "/mnt$target_home/.config/systemd/user/graphical-session.target.wants/voxtype.service"
+
+if [[ -s $full_name_file ]]; then
+  arch-chroot /mnt runuser -u "$username" -- git config --global user.name "$(<"$full_name_file")"
+fi
+if [[ -s $email_file ]]; then
+  arch-chroot /mnt runuser -u "$username" -- git config --global user.email "$(<"$email_file")"
+fi
+if [[ -s $authorized_keys_file ]]; then
+  install -d -m 0700 -o "$(stat -c %u "/mnt$target_home")" -g "$(stat -c %g "/mnt$target_home")" "/mnt$target_home/.ssh"
+  install -m 0600 -o "$(stat -c %u "/mnt$target_home")" -g "$(stat -c %g "/mnt$target_home")" "$authorized_keys_file" "/mnt$target_home/.ssh/authorized_keys"
+  arch-chroot /mnt systemctl enable sshd.service
+  arch-chroot /mnt ufw allow ssh || true
+  grep -Fq -- '--dport 22 -j ACCEPT' /mnt/etc/ufw/user.rules || {
+    echo "ERROR: ufw did not record an allow rule for port 22" >&2
+    exit 1
+  }
+fi
+
+install -d -m 0755 "/mnt$target_home/.config/hypr"
+cat >"/mnt$target_home/.config/hypr/monitors.lua" <<'LUA'
+local omarchy_gdk_scale = 1
+local omarchy_monitor_scale = 2
+
+hl.env("GDK_SCALE", tostring(omarchy_gdk_scale))
+hl.monitor({ output = "Virtual-1", mode = "1920x1200@60", position = "auto", scale = omarchy_monitor_scale })
+LUA
+if ! grep -Fqx 'o.launch_on_start("systemctl --user start wayland-vdagent.service")' "/mnt$target_home/.config/hypr/autostart.lua"; then
+  printf '\no.launch_on_start("systemctl --user start wayland-vdagent.service")\n' >>"/mnt$target_home/.config/hypr/autostart.lua"
+fi
+install -d -m 0755 /mnt/etc/systemd/user
+ln -sfn /dev/null /mnt/etc/systemd/user/spice-vdagent.service
+chown -R "$(stat -c %u "/mnt$target_home")":"$(stat -c %g "/mnt$target_home")" "/mnt$target_home"
+
+cat >/mnt/etc/pacman.conf <<'PACMAN'
+[options]
+HoldPkg = pacman glibc
+Architecture = aarch64
+CheckSpace
+ParallelDownloads = 8
+DisableDownloadTimeout
+SigLevel = Required DatabaseOptional
+LocalFileSigLevel = Optional
+
+[core]
+Server = http://mirror.archlinuxarm.org/$arch/$repo
+[extra]
+Server = http://mirror.archlinuxarm.org/$arch/$repo
+[alarm]
+Server = http://mirror.archlinuxarm.org/$arch/$repo
+[aur]
+Server = http://mirror.archlinuxarm.org/$arch/$repo
+PACMAN
+
+write_state "Finalizing ARM boot"
+arch-chroot /mnt mkinitcpio -P
+root_uuid=$(blkid -s UUID -o value "$root_partition")
+boot_uuid=$(blkid -s UUID -o value "$boot_partition")
+arch-chroot /mnt grub-install \
+  --target=arm64-efi \
+  --efi-directory=/boot/efi \
+  --bootloader-id=Omarchy \
+  --removable \
+  --no-nvram
+cat >/mnt/boot/grub/grub.cfg <<EOF
+set timeout=1
+set default=0
+
+menuentry 'Omarchy ARM' {
+  insmod part_gpt
+  insmod ext2
+  search --no-floppy --fs-uuid --set=root $boot_uuid
+  linux /Image root=UUID=$root_uuid rw rootflags=subvol=@ console=ttyAMA0,115200 console=tty0
+  initrd /initramfs-linux.img
+}
+EOF
+
+arch-chroot /mnt systemctl enable NetworkManager.service sddm.service qemu-guest-agent.service spice-vdagentd.socket
+install -d -m 0755 /mnt/var/lib/llamarchy
+cat >/mnt/var/lib/llamarchy/omarchy-arm-release <<'RELEASE'
+format=1
+release_tag=asahi-quattro-dbc89b00
+source_commit=dbc89b0048682334b572e1f32538bf2fe3f3f2d1
+package_source_commit=81582c4b4c483e0c4000296f452f532d374865c6
+wayland_vdagent=v0.3.4-llamarchy.1
+install_media=offline-aarch64-iso
+RELEASE
+
+write_state "Validating boot setup"
+mapfile -t expected_direct_packages < <(grep -Ev '^($|#)' /mnt/usr/share/omarchy-iso/target-packages)
+arch-chroot /mnt pacman -Q "${expected_direct_packages[@]}" >/dev/null
+while IFS= read -r required_command; do
+  [[ -n $required_command && $required_command != \#* ]] || continue
+  arch-chroot /mnt test -x "$(arch-chroot /mnt bash -lc "command -v '$required_command'")"
+done </mnt/usr/share/omarchy-iso/required-runtime-commands
+printf '%s  %s\n' \
+  a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002 \
+  "/mnt$voxtype_model" | sha256sum --check --status -
+[[ $(< /mnt/usr/share/omarchy/version) == "4.0.0-mac.10" ]]
+[[ -s /mnt/boot/Image && -s /mnt/boot/initramfs-linux.img ]]
+[[ -s /mnt/boot/efi/EFI/BOOT/BOOTAA64.EFI ]]
+[[ -s /mnt/boot/grub/grub.cfg ]]
+
+sync
+install_finished_packages=$(find /mnt/var/lib/pacman/local -mindepth 1 -maxdepth 1 -type d | wc -l)
+(( install_expected_packages > 0 )) || { echo "ERROR: expected package count is unavailable" >&2; exit 1; }
+(( install_finished_packages == install_expected_packages )) || {
+  echo "ERROR: installed package count is $install_finished_packages; expected $install_expected_packages" >&2
+  exit 1
+}
+cleanup_mounts
+trap - ERR
+write_state "Installation complete"
+echo "Installation completed without any errors."

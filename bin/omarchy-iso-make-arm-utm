@@ -1,0 +1,253 @@
+#!/bin/bash
+
+set -euo pipefail
+
+UTMCTL=/Applications/UTM.app/Contents/MacOS/utmctl
+vm_name=Llamarchy-ARM-ISO-Builder
+vm_id=""
+ssh_host=""
+ssh_port=22
+cache_dir="${HOME:-}/Library/Caches/Llamarchy/utm-arm"
+guest_source=/root/omarchy-iso-arm
+guest_cache=/var/cache/llamarchy/utm-arm
+force_rebuild=0
+check_builder=0
+
+usage() {
+  cat <<'USAGE'
+Usage: omarchy-iso-make-arm-utm [--vm NAME | --vm-id UUID] [--ssh-host HOST] [--ssh-port PORT] [--cache-dir DIR] [--check-builder] [--rebuild]
+
+Synchronize this checkout into a native AArch64 UTM builder and create the
+offline ISO in the persistent development cache. An input-matched ISO is
+reused by default.
+USAGE
+}
+
+while (($#)); do
+  case $1 in
+    --vm) vm_name="$2"; shift 2 ;;
+    --vm-id) vm_id="$2"; shift 2 ;;
+    --ssh-host|--guest-host) ssh_host="$2"; shift 2 ;;
+    --ssh-port) ssh_port="$2"; shift 2 ;;
+    --cache-dir) cache_dir="$2"; shift 2 ;;
+    --check-builder) check_builder=1; shift ;;
+    --rebuild) force_rebuild=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "ERROR: unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+ssh_host_override=$ssh_host
+
+[[ $(uname -s) == "Darwin" ]] || { echo "ERROR: this wrapper runs on macOS" >&2; exit 1; }
+[[ -x $UTMCTL ]] || { echo "ERROR: UTM CLI is unavailable at $UTMCTL" >&2; exit 1; }
+[[ -d $cache_dir ]] || { echo "ERROR: persistent ARM cache is unavailable: $cache_dir" >&2; exit 1; }
+[[ $ssh_port =~ ^[0-9]+$ ]] && (( ssh_port > 0 && ssh_port < 65536 )) || { echo "ERROR: invalid builder SSH port: $ssh_port" >&2; exit 1; }
+mkdir -p "$cache_dir/builds/mac10-vm-runtime-v1"
+
+source_root=$(cd "${BASH_SOURCE[0]%/*}/.." && pwd)
+if (( check_builder == 0 )); then
+  compute_input_hash() {
+    {
+      git -C "$source_root/archiso" rev-parse HEAD
+      find "$source_root/builder" "$source_root/configs" -type f ! -path '*/__pycache__/*' ! -name '*.pyc' -print | LC_ALL=C sort |
+        while IFS= read -r input_file; do
+          shasum -a 256 "$input_file"
+        done
+      shasum -a 256 "$source_root/bin/omarchy-iso-make"
+      find \
+        "$cache_dir/releases/asahi-quattro-dbc89b00" \
+        "$cache_dir/builds/81582c4b4c483e0c4000296f452f532d374865c6" \
+        "$cache_dir/builds/mac10-vm-runtime-v1" \
+        -type f ! -name '*.sig' -print 2>/dev/null | LC_ALL=C sort |
+        while IFS= read -r input_file; do
+          shasum -a 256 "$input_file"
+        done
+    } | shasum -a 256 | awk '{print $1}'
+  }
+  input_hash=$(compute_input_hash)
+  input_stamp="$cache_dir/iso/release/.inputs.sha256"
+  latest_iso=$(find "$cache_dir/iso/release" -maxdepth 1 -type f -name '*-aarch64-*.iso' -print | sort | tail -1)
+  cached_input_hash=""
+  if [[ -s $input_stamp ]]; then
+    cached_input_hash=$(<"$input_stamp")
+  fi
+  if (( force_rebuild == 0 )) && [[ -s $latest_iso && $cached_input_hash == "$input_hash" ]]; then
+    echo "Reusing input-matched offline Omarchy ARM ISO: $latest_iso"
+    shasum -a 256 "$latest_iso"
+    exit 0
+  fi
+fi
+
+if [[ -z $vm_id ]]; then
+  vm_inventory=$(osascript \
+    -e 'tell application "UTM"' \
+    -e 'set vmLines to ""' \
+    -e 'repeat with vmItem in every virtual machine' \
+    -e 'set vmLines to vmLines & (id of vmItem) & tab & (name of vmItem) & linefeed' \
+    -e 'end repeat' \
+    -e 'return vmLines' \
+    -e 'end tell')
+  vm_id=$(awk -F '\t' -v expected="$vm_name" '$2 == expected { print $1 }' <<<"$vm_inventory")
+  [[ -n $vm_id ]] || { echo "ERROR: UTM builder VM is unavailable: $vm_name" >&2; exit 1; }
+else
+  [[ $vm_id =~ ^[0-9A-Fa-f-]{36}$ ]] || { echo "ERROR: invalid UTM builder UUID: $vm_id" >&2; exit 1; }
+fi
+
+normalize_mac() {
+  local raw_mac=$1
+  local normalized=""
+  local octet
+  local separator=""
+  local saved_ifs=$IFS
+  IFS=:
+  set -- $raw_mac
+  IFS=$saved_ifs
+  for octet; do
+    printf -v octet '%x' "$((16#$octet))"
+    normalized+="$separator$octet"
+    separator=:
+  done
+  printf '%s\n' "$normalized"
+}
+
+lookup_ipv4_by_mac() {
+  local expected_mac=$1
+  local candidate_ip
+  local candidate_mac
+  while read -r candidate_ip candidate_mac; do
+    if [[ $(normalize_mac "$candidate_mac") == "$expected_mac" ]]; then
+      printf '%s\n' "$candidate_ip"
+      return 0
+    fi
+  done < <(arp -an | awk '$2 ~ /^\([0-9.]+\)$/ && $4 ~ /^([[:xdigit:]]+:){5}[[:xdigit:]]+$/ { gsub(/[()]/, "", $2); print $2, $4 }')
+  return 1
+}
+
+builder_mac_display=$(osascript \
+  -e 'tell application "UTM"' \
+  -e "set targetVM to virtual machine id \"$vm_id\"" \
+  -e 'set vmConfig to configuration of targetVM' \
+  -e 'set netConfig to item 1 of network interfaces of vmConfig' \
+  -e 'return address of netConfig' \
+  -e 'end tell')
+[[ $builder_mac_display =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]] || { echo "ERROR: builder MAC address is unavailable" >&2; exit 1; }
+builder_mac=$(normalize_mac "$builder_mac_display")
+
+vm_status=$(osascript \
+  -e 'tell application "UTM"' \
+  -e "set targetVM to virtual machine id \"$vm_id\"" \
+  -e 'return status of targetVM as text' \
+  -e 'end tell')
+if [[ $vm_status != "started" ]]; then
+  "$UTMCTL" start "$vm_id" 2>/dev/null || true
+fi
+builder_ssh=()
+builder_ready() {
+  local architecture
+  local guest_hostname
+  local guest_macs
+  local identity
+  local remaining
+  identity=$("${builder_ssh[@]}" 'uname -m; hostname; cat /sys/class/net/*/address' 2>/dev/null) || return 1
+  architecture=${identity%%$'\n'*}
+  remaining=${identity#*$'\n'}
+  guest_hostname=${remaining%%$'\n'*}
+  guest_macs=${remaining#*$'\n'}
+  [[ $architecture == "aarch64" ]] || return 1
+  [[ $guest_hostname == "llamarchy-arm-builder" ]] || return 1
+  grep -Fxi "$builder_mac_display" <<<"$guest_macs" >/dev/null
+}
+for attempt in {1..180}; do
+  if [[ -z $ssh_host ]]; then
+    ssh_host=$(lookup_ipv4_by_mac "$builder_mac" || true)
+  fi
+  if [[ -n $ssh_host ]]; then
+    builder_ssh=(
+      ssh -o BatchMode=yes -o ConnectTimeout=2 -o StrictHostKeyChecking=accept-new
+      -o "HostName=$ssh_host" -o "Port=$ssh_port" -o HostKeyAlias=llamarchy-arm-builder-ipv4
+      root@llamarchy-arm-builder
+    )
+  fi
+  if ((${#builder_ssh[@]})) && builder_ready; then
+    break
+  fi
+  if [[ -z $ssh_host_override ]]; then
+    ssh_host=""
+  fi
+  (( attempt < 180 )) || { echo "ERROR: ARM builder SSH did not become ready" >&2; exit 1; }
+  sleep 1
+done
+if (( check_builder )); then
+  echo "Builder verified: vm=$vm_id mac=$builder_mac_display ipv4=$ssh_host hostname=llamarchy-arm-builder arch=aarch64"
+  exit 0
+fi
+
+ssh_transport="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o HostName=$ssh_host -o Port=$ssh_port -o HostKeyAlias=llamarchy-arm-builder-ipv4"
+ssh_builder=("${builder_ssh[@]}")
+
+rsync -a --delete --exclude .git --exclude __pycache__ --exclude '*.pyc' --exclude release --exclude test-runs \
+  -e "$ssh_transport" "$source_root/" "root@omarchy-arm-builder:$guest_source/"
+
+"${ssh_builder[@]}" "mkdir -p '$guest_cache/releases/node' '$guest_cache/builds' '$guest_cache/pacman/pkg' '$guest_cache/repo-index' '$guest_cache/sources' '$guest_cache/iso/release'"
+mkdir -p "$cache_dir/releases/node" "$cache_dir/builds" "$cache_dir/pacman/pkg" "$cache_dir/repo-index" "$cache_dir/sources" "$cache_dir/iso/release"
+
+# Immutable signed releases and native builds are canonical on the host. The
+# package cache is additive so an interrupted previous build can resume from
+# artifacts that reached the guest but have not yet been synchronized back.
+rsync -a --delete -e "$ssh_transport" "$cache_dir/releases/" "root@omarchy-arm-builder:$guest_cache/releases/"
+rsync -a --delete -e "$ssh_transport" "$cache_dir/builds/" "root@omarchy-arm-builder:$guest_cache/builds/"
+rsync -a -e "$ssh_transport" "$cache_dir/repo-index/" "root@omarchy-arm-builder:$guest_cache/repo-index/"
+rsync -a -e "$ssh_transport" "$cache_dir/sources/" "root@omarchy-arm-builder:$guest_cache/sources/"
+rsync -a -e "$ssh_transport" "$cache_dir/pacman/pkg/" "root@omarchy-arm-builder:$guest_cache/pacman/pkg/"
+
+sync_guest_cache() {
+  local build_status="$1"
+  local command_status=0
+  local sync_status=0
+  trap - EXIT
+  set +e
+  rsync -a -e "$ssh_transport" "root@omarchy-arm-builder:$guest_cache/pacman/pkg/" "$cache_dir/pacman/pkg/"
+  command_status=$?
+  (( command_status == 0 )) || sync_status=$command_status
+  rsync -a -e "$ssh_transport" "root@omarchy-arm-builder:$guest_cache/releases/node/" "$cache_dir/releases/node/"
+  command_status=$?
+  (( command_status == 0 )) || sync_status=$command_status
+  rsync -a -e "$ssh_transport" "root@omarchy-arm-builder:$guest_cache/builds/" "$cache_dir/builds/"
+  command_status=$?
+  (( command_status == 0 )) || sync_status=$command_status
+  rsync -a -e "$ssh_transport" "root@omarchy-arm-builder:$guest_cache/repo-index/" "$cache_dir/repo-index/"
+  command_status=$?
+  (( command_status == 0 )) || sync_status=$command_status
+  rsync -a -e "$ssh_transport" "root@omarchy-arm-builder:$guest_cache/sources/" "$cache_dir/sources/"
+  command_status=$?
+  (( command_status == 0 )) || sync_status=$command_status
+  rsync -a -e "$ssh_transport" "root@omarchy-arm-builder:$guest_cache/iso/release/" "$cache_dir/iso/release/"
+  command_status=$?
+  (( command_status == 0 )) || sync_status=$command_status
+  set -e
+
+  if (( build_status != 0 )); then
+    exit "$build_status"
+  elif (( sync_status != 0 )); then
+    exit "$sync_status"
+  fi
+}
+trap 'sync_guest_cache $?' EXIT
+
+"${ssh_builder[@]}" \
+  "cd '$guest_source' && OMARCHY_ARM_ARTIFACT_CACHE='$guest_cache' ./builder/build-arm-runtime-packages.sh"
+"${ssh_builder[@]}" \
+  "cd '$guest_source' && OMARCHY_ISO_SOURCE_ROOT='$guest_source' OMARCHY_ARM_ARTIFACT_CACHE='$guest_cache' ./builder/build-quickshell-arm.sh"
+"${ssh_builder[@]}" \
+  "cd '$guest_source' && ./bin/omarchy-iso-make --arch aarch64 --native-cache '$guest_cache' --no-boot-offer"
+sync_guest_cache 0
+
+latest_iso=$(find "$cache_dir/iso/release" -maxdepth 1 -type f -name '*-aarch64-*.iso' -print | sort | tail -1)
+[[ -s $latest_iso ]] || { echo "ERROR: ARM ISO build produced no artifact" >&2; exit 1; }
+input_hash=$(compute_input_hash)
+printf '%s\n' "$input_hash" >"$input_stamp"
+
+echo
+echo "Offline ARM ISO: $latest_iso"
+shasum -a 256 "$latest_iso"

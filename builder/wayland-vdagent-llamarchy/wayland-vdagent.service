@@ -1,0 +1,16 @@
+[Unit]
+Description=SPICE resize and clipboard bridge for Wayland
+Documentation=https://github.com/Llamarchy/wayland-vdagent
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+Environment=WAYLAND_VDAGENT_HYPRLAND_OUTPUT=Virtual-1
+Environment=WAYLAND_VDAGENT_HYPRLAND_SCALE=2
+ExecStart=/usr/bin/wayland-vdagent
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

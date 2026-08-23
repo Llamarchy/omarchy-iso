@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Foreground Omarchy ISO install UI supervisor.
 #
 # This process is the only owner of the visible install UI. It launches the
@@ -6,6 +6,26 @@
 # log, renders progress while the child runs, then renders the final installed
 # time + reboot prompt itself. There is deliberately no background dashboard.
 set -euo pipefail
+
+read_progress_state() {
+  jq -r '
+    (.current_phase // .phase // "Starting installation"),
+    ((.finished_at // 0) | tonumber? // 0 | floor),
+    ((.current_index // -1) | tonumber? // -1 | floor),
+    ((.total_phases // 0) | tonumber? // 0 | floor),
+    (.target // "/mnt")
+  ' "$1" 2>/dev/null
+}
+
+if [[ ${1:-} == "--read-progress-state" ]]; then
+  if (( $# == 2 )); then
+    read_progress_state "$2"
+    exit 0
+  else
+    echo "Usage: $0 --read-progress-state STATE" >&2
+    exit 2
+  fi
+fi
 
 usage() {
   echo "Usage: $0 <log-file> <state-file> -- <installer command...>" >&2
@@ -299,13 +319,7 @@ install_progress() {
   PROGRESS_PM=$POS
   [[ -f $STATE_FILE ]] || return 0
 
-  mapfile -t state < <(jq -r '
-    (.current_phase // "Starting installation"),
-    ((.finished_at // 0) | tonumber? // 0 | floor),
-    ((.current_index // -1) | tonumber? // -1 | floor),
-    ((.total_phases // 0) | tonumber? // 0 | floor),
-    (.target // "/mnt")
-  ' "$STATE_FILE" 2>/dev/null)
+  mapfile -t state < <(read_progress_state "$STATE_FILE")
   (( ${#state[@]} == 5 )) || return 0
   phase="${state[0]}" finished="${state[1]}"
   index="${state[2]}" total="${state[3]}" target="${state[4]}"
@@ -782,7 +796,7 @@ if (( status != 0 )); then
   failure_summary=""
   if [[ -f $STATE_FILE ]]; then
     failure_summary="$(jq -r '
-      (.current_phase // empty | "last installer phase: \(.)"),
+      (.current_phase // .phase // empty | "last installer phase: \(.)"),
       ((.phases // []) | map(select(.status == "failed")) | last // empty
         | "failed phase: \(.name): \(.error)")
     ' "$STATE_FILE" 2>/dev/null || true)"

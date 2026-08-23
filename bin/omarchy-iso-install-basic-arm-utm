@@ -1,0 +1,225 @@
+#!/bin/bash
+
+set -Eeuo pipefail
+trap 'printf "ERROR: basic ARM UTM acceptance failed at %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
+
+UTMCTL=/Applications/UTM.app/Contents/MacOS/utmctl
+vm_name=ArchLinuxARM-basic-green-acceptance
+cache_dir="${LLAMARCHY_ARM_CACHE:-${HOME}/Library/Caches/Llamarchy/utm-arm}"
+iso=""
+hostname=arch-arm-basic
+memory_mib=4096
+cpu_cores=4
+disk_mib=32768
+timeout_seconds=900
+
+usage() {
+  cat <<'USAGE'
+Usage: omarchy-iso-install-basic-arm-utm [options]
+
+Create a fresh native AArch64 UTM VM with no network interface, install the
+complete basic Arch Linux ARM system from the cached ISO, remove the ISO, boot
+the installed disk, and verify the result from inside the guest.
+
+Options:
+  --iso PATH          ISO to install (default: latest cached basic ARM ISO)
+  --vm NAME           New VM name
+  --cache-dir DIR     Persistent ARM development cache
+  --hostname NAME     Installed hostname (default: arch-arm-basic)
+  --memory MIB        Guest memory (default: 4096)
+  --cpus COUNT        Guest CPU cores (default: 4)
+  --disk MIB          Guest disk capacity (default: 32768)
+  --timeout SECONDS   End-to-end readiness timeout (default: 900)
+  -h, --help          Show this help
+USAGE
+}
+
+while (($#)); do
+  case $1 in
+    --iso) iso="$2"; shift 2 ;;
+    --vm) vm_name="$2"; shift 2 ;;
+    --cache-dir) cache_dir="$2"; shift 2 ;;
+    --hostname) hostname="$2"; shift 2 ;;
+    --memory) memory_mib="$2"; shift 2 ;;
+    --cpus) cpu_cores="$2"; shift 2 ;;
+    --disk) disk_mib="$2"; shift 2 ;;
+    --timeout) timeout_seconds="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "ERROR: unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+[[ $(uname -s) == "Darwin" ]] || { echo "ERROR: this command runs on macOS" >&2; exit 1; }
+[[ -x $UTMCTL ]] || { echo "ERROR: UTM CLI is unavailable at $UTMCTL" >&2; exit 1; }
+command -v osascript >/dev/null || { echo "ERROR: osascript is unavailable" >&2; exit 1; }
+[[ $hostname =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,62}$ ]] || { echo "ERROR: invalid hostname: $hostname" >&2; exit 1; }
+[[ $memory_mib =~ ^[0-9]+$ && $cpu_cores =~ ^[0-9]+$ && $disk_mib =~ ^[0-9]+$ && $timeout_seconds =~ ^[0-9]+$ ]] || {
+  echo "ERROR: memory, CPU, disk, and timeout values must be integers" >&2
+  exit 1
+}
+(( memory_mib >= 4096 && cpu_cores >= 2 && disk_mib >= 8192 && timeout_seconds >= 120 )) || {
+  echo "ERROR: use at least 4096 MiB RAM, 2 CPUs, an 8192 MiB disk, and a 120 second timeout" >&2
+  exit 1
+}
+
+if [[ -z $iso ]]; then
+  iso=$(find "$cache_dir/basic-iso/release" -maxdepth 1 -type f -name 'archlinuxarm-basic-*-aarch64.iso' -print | sort | tail -1)
+fi
+[[ -s $iso ]] || { echo "ERROR: cached basic ARM ISO is unavailable: $iso" >&2; exit 1; }
+iso=$(cd "${iso%/*}" && pwd)/${iso##*/}
+
+vm_id=$(
+  osascript - "$vm_name" "$iso" "$memory_mib" "$cpu_cores" "$disk_mib" <<'APPLESCRIPT'
+on run argv
+  set vmName to item 1 of argv
+  set isoPath to item 2 of argv
+  set vmMemory to (item 3 of argv) as integer
+  set vmCores to (item 4 of argv) as integer
+  set vmDisk to (item 5 of argv) as integer
+
+  tell application "UTM"
+    if (count of (every virtual machine whose name is vmName)) is greater than 0 then
+      error "A UTM virtual machine named '" & vmName & "' already exists."
+    end if
+
+    set newVM to make new virtual machine with properties {backend:qemu, configuration:{name:vmName, notes:"Unattended zero-network basic Arch Linux ARM ISO acceptance", architecture:"aarch64", machine:"virt", memory:vmMemory, cpu cores:vmCores, hypervisor:true, uefi:true, drives:{{removable:true, interface:USB, source:(POSIX file isoPath)}, {removable:false, interface:VirtIO, guest size:vmDisk}}, network interfaces:{}, displays:{{hardware:"virtio-gpu-gl-pci", dynamic resolution:true, native resolution:true}}}}
+    return id of newVM
+  end tell
+end run
+APPLESCRIPT
+)
+[[ $vm_id =~ ^[0-9A-Fa-f-]{36}$ ]] || { echo "ERROR: UTM returned an invalid VM identifier: $vm_id" >&2; exit 1; }
+
+disk_id=$(
+  osascript - "$vm_id" <<'APPLESCRIPT'
+on run argv
+  set vmID to item 1 of argv
+  tell application "UTM"
+    set targetVM to first virtual machine whose id is vmID
+    set targetConfiguration to configuration of targetVM
+    set vmDrives to drives of targetConfiguration
+    repeat with vmDrive in vmDrives
+      if removable of vmDrive is false then return id of vmDrive
+    end repeat
+    error "The VM has no non-removable target disk."
+  end tell
+end run
+APPLESCRIPT
+)
+[[ $disk_id =~ ^[0-9A-Fa-f-]{36}$ ]] || { echo "ERROR: UTM returned an invalid disk identifier: $disk_id" >&2; exit 1; }
+
+guest_exec() {
+  "$UTMCTL" exec --debug "$vm_id" --cmd "$@"
+}
+
+guest_file() {
+  "$UTMCTL" file pull --debug "$vm_id" "$1"
+}
+
+read_guest_net_devices() {
+  guest_exec /usr/bin/ls /sys/class/net 2>/dev/null | tr '\n' ' ' | xargs
+}
+
+deadline=$((SECONDS + timeout_seconds))
+"$UTMCTL" start --debug "$vm_id"
+echo "Created $vm_name ($vm_id)"
+echo "Waiting for the unattended live ISO boot..."
+while true; do
+  architecture=$(guest_exec /usr/bin/uname -m 2>/dev/null || true)
+  root_source=$(guest_exec /usr/bin/findmnt -n -o SOURCE / 2>/dev/null || true)
+  if [[ $architecture == "aarch64" && $root_source == "airootfs" ]]; then
+    break
+  fi
+  (( SECONDS < deadline )) || { echo "ERROR: live basic ARM ISO did not become ready" >&2; exit 1; }
+  sleep 2
+done
+
+net_devices=$(read_guest_net_devices)
+[[ $net_devices == "lo" ]] || { echo "ERROR: live VM exposes unexpected network devices: $net_devices" >&2; exit 1; }
+guest_exec /usr/bin/test -x /root/install-basic-arm.sh
+echo "Live ISO verified: native AArch64, zero network, bundled installer present."
+
+guest_exec /root/install-basic-arm.sh /dev/vda "$hostname" >/dev/null
+echo "Waiting for the offline disk installation..."
+while true; do
+  install_state=$(guest_file /run/basic-arm-install.state 2>/dev/null || true)
+  if [[ $install_state == "complete" ]]; then
+    break
+  elif [[ $install_state == failed:* ]]; then
+    guest_file /run/basic-arm-install.log 2>/dev/null || true
+    echo "ERROR: offline basic ARM installer reported: $install_state" >&2
+    exit 1
+  fi
+  (( SECONDS < deadline )) || {
+    guest_file /run/basic-arm-install.log 2>/dev/null || true
+    echo "ERROR: offline basic ARM installation timed out at: ${install_state:-unknown}" >&2
+    exit 1
+  }
+  sleep 2
+done
+guest_file /run/basic-arm-install.log | grep -Fq BASIC_ARM_INSTALL_COMPLETE
+echo "Disk installation completed; shutting down the live environment."
+
+guest_exec /usr/bin/systemctl poweroff >/dev/null 2>&1 || true
+while [[ $("$UTMCTL" status "$vm_id") != "stopped" ]]; do
+  (( SECONDS < deadline )) || { echo "ERROR: live VM did not finish its clean shutdown" >&2; exit 1; }
+  sleep 2
+done
+
+osascript - "$vm_id" "$disk_id" <<'APPLESCRIPT'
+on run argv
+  set vmID to item 1 of argv
+  set diskID to item 2 of argv
+  tell application "UTM"
+    set targetVM to first virtual machine whose id is vmID
+    update configuration targetVM with {drives:{{id:diskID, removable:false, interface:VirtIO}}}
+  end tell
+end run
+APPLESCRIPT
+
+drive_summary=$(
+  osascript - "$vm_id" <<'APPLESCRIPT'
+on run argv
+  set vmID to item 1 of argv
+  tell application "UTM"
+    set targetVM to first virtual machine whose id is vmID
+    set targetConfiguration to configuration of targetVM
+    set vmDrives to drives of targetConfiguration
+    set removableCount to 0
+    repeat with vmDrive in vmDrives
+      if removable of vmDrive is true then set removableCount to removableCount + 1
+    end repeat
+    return (count of vmDrives as text) & ":" & (removableCount as text)
+  end tell
+end run
+APPLESCRIPT
+)
+[[ $drive_summary == "1:0" ]] || { echo "ERROR: ISO removal validation failed: $drive_summary" >&2; exit 1; }
+
+"$UTMCTL" start --debug "$vm_id"
+echo "ISO removed; waiting for the installed disk boot..."
+while true; do
+  architecture=$(guest_exec /usr/bin/uname -m 2>/dev/null || true)
+  root_layout=$(guest_exec /usr/bin/findmnt -n -o SOURCE,FSTYPE / 2>/dev/null || true)
+  if [[ $architecture == "aarch64" && $root_layout == "/dev/vda2 ext4" ]]; then
+    break
+  fi
+  (( SECONDS < deadline )) || { echo "ERROR: installed basic ARM system did not become ready" >&2; exit 1; }
+  sleep 2
+done
+
+[[ $(guest_exec /usr/bin/cat /etc/hostname) == "$hostname" ]]
+grep -Fqx 'ID=archarm' < <(guest_exec /usr/bin/cat /etc/os-release)
+[[ $(guest_exec /usr/bin/findmnt -n -o SOURCE,FSTYPE /boot/efi) == "/dev/vda1 vfat" ]]
+[[ $(read_guest_net_devices) == "lo" ]]
+[[ $(guest_exec /usr/bin/systemctl is-active qemu-guest-agent.service) == "active" ]]
+[[ $(guest_exec /usr/bin/systemctl is-active sshd.service) == "active" ]]
+guest_exec /usr/bin/bash -c 'for command in bash cat cp grep ls mount mv pacman sed ssh systemctl; do command -v "$command" >/dev/null || exit 1; done'
+guest_exec /usr/bin/bash -c 'compgen -G "/var/lib/pacman/local/base-*" >/dev/null && compgen -G "/var/lib/pacman/local/linux-aarch64-*" >/dev/null && compgen -G "/var/lib/pacman/local/grub-*" >/dev/null'
+guest_exec /usr/bin/test -s /boot/Image
+guest_exec /usr/bin/test -s /boot/initramfs-linux-aarch64.img
+guest_exec /usr/bin/test -s /boot/efi/EFI/BOOT/BOOTAA64.EFI
+guest_exec /usr/bin/test -s /boot/grub/grub.cfg
+
+echo "Basic ARM green path passed: $vm_name ($vm_id)"
+echo "The cached ISO installed and booted native Arch Linux ARM with zero network and no manual intervention."

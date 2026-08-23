@@ -1,0 +1,376 @@
+#!/bin/bash
+
+set -eEuo pipefail
+
+UTMCTL=/Applications/UTM.app/Contents/MacOS/utmctl
+vm_name=Llamarchy-ISO-offline-acceptance
+cache_dir="${HOME:-}/Library/Caches/Llamarchy/utm-arm"
+iso=""
+username=dev
+password=dev
+hostname=omarchy-offline-test
+memory_mib=8192
+cpu_cores=6
+disk_mib=65536
+timeout_seconds=3600
+wait_for_install=1
+authorized_key=""
+
+usage() {
+  cat <<'USAGE'
+Usage: omarchy-iso-install-arm-utm [options]
+
+Create a fresh native AArch64 UTM VM with no network interface and install the
+latest cached offline Omarchy ARM ISO through its CIDATA autoinstall path.
+
+Options:
+  --iso PATH          ISO to install (default: latest cached AArch64 ISO)
+  --vm NAME           New VM name (default: Llamarchy-ISO-offline-acceptance)
+  --cache-dir DIR     Persistent ARM development cache
+  --username NAME     Test login name (default: dev)
+  --password VALUE    Test login password (default: dev)
+  --hostname NAME     Installed hostname (default: omarchy-offline-test)
+  --memory MIB        Guest memory (default: 8192)
+  --cpus COUNT        Guest CPU cores (default: 6)
+  --disk MIB          Guest disk capacity (default: 65536)
+  --timeout SECONDS   Install completion timeout (default: 3600)
+  --authorized-key PATH
+                      Public SSH key to install for the configured user
+  --start-only        Create and start the VM, then return without monitoring
+  -h, --help          Show this help
+USAGE
+}
+
+while (($#)); do
+  case $1 in
+    --iso) iso="$2"; shift 2 ;;
+    --vm) vm_name="$2"; shift 2 ;;
+    --cache-dir) cache_dir="$2"; shift 2 ;;
+    --username) username="$2"; shift 2 ;;
+    --password) password="$2"; shift 2 ;;
+    --hostname) hostname="$2"; shift 2 ;;
+    --memory) memory_mib="$2"; shift 2 ;;
+    --cpus) cpu_cores="$2"; shift 2 ;;
+    --disk) disk_mib="$2"; shift 2 ;;
+    --timeout) timeout_seconds="$2"; shift 2 ;;
+    --authorized-key) authorized_key="$2"; shift 2 ;;
+    --start-only) wait_for_install=0; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "ERROR: unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+[[ $(uname -s) == "Darwin" ]] || { echo "ERROR: this command runs on macOS" >&2; exit 1; }
+[[ -x $UTMCTL ]] || { echo "ERROR: UTM CLI is unavailable at $UTMCTL" >&2; exit 1; }
+for command in hdiutil jq openssl osascript; do
+  command -v "$command" >/dev/null || { echo "ERROR: required host command is unavailable: $command" >&2; exit 1; }
+done
+[[ $username =~ ^[a-z_][a-z0-9_-]{0,31}$ && $username != "root" ]] || { echo "ERROR: invalid username: $username" >&2; exit 1; }
+[[ $hostname =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,62}$ ]] || { echo "ERROR: invalid hostname: $hostname" >&2; exit 1; }
+[[ $memory_mib =~ ^[0-9]+$ && $cpu_cores =~ ^[0-9]+$ && $disk_mib =~ ^[0-9]+$ && $timeout_seconds =~ ^[0-9]+$ ]] || {
+  echo "ERROR: memory, CPU, disk, and timeout values must be integers" >&2
+  exit 1
+}
+(( memory_mib >= 4096 && cpu_cores >= 2 && disk_mib >= 40960 && timeout_seconds >= 60 )) || {
+  echo "ERROR: use at least 4096 MiB RAM, 2 CPUs, a 40960 MiB disk, and a 60 second timeout" >&2
+  exit 1
+}
+
+if [[ -n $authorized_key ]]; then
+  command -v ssh-keygen >/dev/null || { echo "ERROR: required host command is unavailable: ssh-keygen" >&2; exit 1; }
+  [[ -s $authorized_key ]] || { echo "ERROR: SSH public key is unavailable or empty: $authorized_key" >&2; exit 1; }
+  ssh-keygen -l -f "$authorized_key" >/dev/null 2>&1 || { echo "ERROR: invalid SSH public key: $authorized_key" >&2; exit 1; }
+  authorized_key=$(cd "$(dirname "$authorized_key")" && pwd)/$(basename "$authorized_key")
+fi
+
+if [[ -z $iso ]]; then
+  iso=$(find "$cache_dir/iso/release" -maxdepth 1 -type f -name '*-aarch64-*.iso' -print | sort | tail -1)
+fi
+[[ -s $iso ]] || { echo "ERROR: offline ARM ISO is unavailable: $iso" >&2; exit 1; }
+iso=$(cd "${iso%/*}" && pwd)/${iso##*/}
+
+test_dir="$cache_dir/test/$vm_name"
+cidata_dir=$(mktemp -d "${TMPDIR:-/tmp}/omarchy-arm-cidata.XXXXXX")
+cleanup() {
+  rm -rf "$cidata_dir"
+}
+trap cleanup EXIT
+mkdir -p "$test_dir"
+cidata_iso="$test_dir/cidata.iso"
+
+password_hash=$(openssl passwd -6 "$password")
+jq -n \
+  --arg username "$username" \
+  --arg password_hash "$password_hash" \
+  '{
+    root_enc_password: $password_hash,
+    users: [{enc_password: $password_hash, groups: [], sudo: true, username: $username}]
+  }' >"$cidata_dir/user_credentials.json"
+jq -n \
+  --arg hostname "$hostname" \
+  '{
+    omarchy_install: {mode: "full_disk", defer_provisioning: false, auto_reboot: false},
+    disk_config: {
+      disk_encryption: null,
+      device_modifications: [{device: "/dev/vda", wipe: true}]
+    },
+    hostname: $hostname,
+    timezone: "UTC",
+    locale_config: {kb_layout: "us", sys_enc: "UTF-8", sys_lang: "en_US.UTF-8"}
+  }' >"$cidata_dir/user_configuration.json"
+printf '%s\n' "Omarchy ARM Test" >"$cidata_dir/user_full_name.txt"
+printf '%s\n' "arm-test@llamarchy.org" >"$cidata_dir/user_email_address.txt"
+printf '%s\n' false >"$cidata_dir/user_encrypt_installation.txt"
+if [[ -n $authorized_key ]]; then
+  install -m 0644 "$authorized_key" "$cidata_dir/authorized_keys"
+fi
+
+hdiutil makehybrid -quiet -ov -iso -joliet \
+  -iso-volume-name CIDATA -joliet-volume-name CIDATA \
+  -o "$cidata_iso" "$cidata_dir"
+[[ -s $cidata_iso ]] || { echo "ERROR: CIDATA image creation failed" >&2; exit 1; }
+
+vm_id=$(
+  osascript - "$vm_name" "$iso" "$cidata_iso" "$memory_mib" "$cpu_cores" "$disk_mib" <<'APPLESCRIPT'
+on run argv
+  set vmName to item 1 of argv
+  set isoPath to item 2 of argv
+  set cidataPath to item 3 of argv
+  set vmMemory to (item 4 of argv) as integer
+  set vmCores to (item 5 of argv) as integer
+  set vmDisk to (item 6 of argv) as integer
+
+  tell application "UTM"
+    if (count of (every virtual machine whose name is vmName)) is greater than 0 then
+      error "A UTM virtual machine named '" & vmName & "' already exists."
+    end if
+
+    set newVM to make new virtual machine with properties {backend:qemu, configuration:{name:vmName, notes:"Offline ARM ISO acceptance VM", architecture:"aarch64", machine:"virt", memory:vmMemory, cpu cores:vmCores, hypervisor:true, uefi:true, drives:{{removable:true, interface:USB, source:(POSIX file isoPath)}, {removable:true, interface:USB, source:(POSIX file cidataPath)}, {removable:false, interface:VirtIO, guest size:vmDisk}}, network interfaces:{}, displays:{{hardware:"virtio-gpu-gl-pci", dynamic resolution:true, native resolution:true}}}}
+    return id of newVM
+  end tell
+end run
+APPLESCRIPT
+)
+[[ $vm_id =~ ^[0-9A-Fa-f-]{36}$ ]] || { echo "ERROR: UTM returned an invalid VM identifier: $vm_id" >&2; exit 1; }
+
+disk_id=$(
+  osascript - "$vm_id" <<'APPLESCRIPT'
+on run argv
+  set vmID to item 1 of argv
+  tell application "UTM"
+    set targetVM to first virtual machine whose id is vmID
+    set targetConfiguration to configuration of targetVM
+    set vmDrives to drives of targetConfiguration
+    repeat with vmDrive in vmDrives
+      if removable of vmDrive is false then return id of vmDrive
+    end repeat
+    error "The VM has no non-removable target disk."
+  end tell
+end run
+APPLESCRIPT
+)
+[[ $disk_id =~ ^[0-9A-Fa-f-]{36}$ ]] || { echo "ERROR: UTM returned an invalid disk identifier: $disk_id" >&2; exit 1; }
+
+"$UTMCTL" start --debug "$vm_id"
+echo "Created $vm_name ($vm_id)"
+echo "Architecture: native aarch64"
+echo "Network interfaces: 0"
+echo "Display: virtio-gpu-gl-pci, dynamic resolution, Retina"
+echo "Login after installation: $username / $password"
+if [[ -n $authorized_key ]]; then
+  echo "SSH public key: $authorized_key"
+fi
+
+(( wait_for_install == 1 )) || exit 0
+
+guest_exec() {
+  "$UTMCTL" exec --debug "$vm_id" --cmd "$@"
+}
+
+read_guest_net_devices() {
+  local attempt devices
+
+  for attempt in {1..30}; do
+    devices=$(guest_exec /usr/bin/ls /sys/class/net 2>/dev/null | tr '\n' ' ' | xargs)
+    if [[ -n $devices ]]; then
+      printf '%s\n' "$devices"
+      return 0
+    fi
+    (( attempt < 30 )) || return 1
+    sleep 1
+  done
+}
+
+echo "Waiting for the live ARM guest agent..."
+deadline=$((SECONDS + timeout_seconds))
+live_boot_id=""
+while true; do
+  live_arch=$(guest_exec /usr/bin/uname -m 2>/dev/null || true)
+  live_boot_id=$(guest_exec /usr/bin/cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
+  if [[ $live_arch == "aarch64" && $live_boot_id =~ ^[0-9a-f-]{36}$ ]]; then
+    break
+  fi
+  (( SECONDS < deadline )) || { echo "ERROR: live ARM guest agent did not become ready" >&2; exit 1; }
+  sleep 2
+done
+
+net_devices=$(read_guest_net_devices) || { echo "ERROR: live guest network devices did not become readable" >&2; exit 1; }
+[[ $net_devices == "lo" ]] || { echo "ERROR: test VM unexpectedly exposes network devices: $net_devices" >&2; exit 1; }
+echo "Verified inside the live environment: only the loopback interface exists."
+
+echo "Waiting for the offline installation to complete..."
+install_started=$SECONDS
+last_phase=""
+progress_schema_verified=0
+while true; do
+  install_state=$(guest_exec /usr/bin/cat /run/omarchy-install/state.json 2>/dev/null || true)
+  current_boot_id=$(guest_exec /usr/bin/cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
+  if [[ $current_boot_id =~ ^[0-9a-f-]{36}$ && $current_boot_id != "$live_boot_id" ]]; then
+    echo "ERROR: live ISO rebooted before the host completed installation handoff" >&2
+    exit 1
+  fi
+  phase=$(jq -r '.phase // .current_phase // empty' <<<"$install_state" 2>/dev/null || true)
+  if jq -e '
+    (.current_phase | type == "string") and
+    (.current_index | type == "number") and
+    (.total_phases | type == "number" and . >= 5) and
+    (.target == "/mnt")
+  ' <<<"$install_state" >/dev/null 2>&1; then
+    progress_schema_verified=1
+  fi
+  if [[ -n $phase && $phase != "$last_phase" ]]; then
+    printf '[+%ss] %s\n' "$((SECONDS - install_started))" "$phase"
+    last_phase=$phase
+  fi
+  if grep -Fq 'Installation complete' <<<"$install_state"; then
+    break
+  fi
+  (( SECONDS < deadline )) || { echo "ERROR: offline installation timed out" >&2; exit 1; }
+  sleep 5
+done
+
+(( progress_schema_verified == 1 )) || {
+  echo "ERROR: ARM installer never published the dashboard progress schema" >&2
+  exit 1
+}
+jq -e '
+  .current_phase == "Installation complete" and
+  (.finished_at | type == "number") and
+  (.installed_packages | type == "number" and . > 0) and
+  (.expected_packages | type == "number" and . > 0) and
+  (.installed_packages == .expected_packages)
+' <<<"$install_state" >/dev/null || {
+  echo "ERROR: completed ARM installer state is incomplete" >&2
+  printf '%s\n' "$install_state" >&2
+  exit 1
+}
+
+echo "Installation completed in $((SECONDS - install_started)) seconds; shutting down the live environment."
+guest_exec /usr/bin/systemctl poweroff >/dev/null 2>&1 || true
+deadline=$((SECONDS + timeout_seconds))
+while [[ $("$UTMCTL" status "$vm_id") != "stopped" ]]; do
+  (( SECONDS < deadline )) || { echo "ERROR: live VM did not finish its clean shutdown" >&2; exit 1; }
+  sleep 2
+done
+
+osascript - "$vm_id" "$disk_id" <<'APPLESCRIPT'
+on run argv
+  set vmID to item 1 of argv
+  set diskID to item 2 of argv
+  tell application "UTM"
+    set targetVM to first virtual machine whose id is vmID
+    update configuration targetVM with {drives:{{id:diskID, removable:false, interface:VirtIO}}}
+  end tell
+end run
+APPLESCRIPT
+
+drive_summary=$(
+  osascript - "$vm_id" <<'APPLESCRIPT'
+on run argv
+  set vmID to item 1 of argv
+  tell application "UTM"
+    set targetVM to first virtual machine whose id is vmID
+    set targetConfiguration to configuration of targetVM
+    set vmDrives to drives of targetConfiguration
+    set removableCount to 0
+    repeat with vmDrive in vmDrives
+      if removable of vmDrive is true then set removableCount to removableCount + 1
+    end repeat
+    return (count of vmDrives as text) & ":" & (removableCount as text)
+  end tell
+end run
+APPLESCRIPT
+)
+[[ $drive_summary == "1:0" ]] || { echo "ERROR: install-media removal validation failed: $drive_summary" >&2; exit 1; }
+
+"$UTMCTL" start --debug "$vm_id"
+echo "Install media removed; waiting for the installed disk boot."
+
+deadline=$((SECONDS + timeout_seconds))
+while true; do
+  release=$(guest_exec /usr/bin/cat /var/lib/llamarchy/omarchy-arm-release 2>/dev/null || true)
+  if grep -Fq 'install_media=offline-aarch64-iso' <<<"$release"; then
+    break
+  fi
+  (( SECONDS < deadline )) || { echo "ERROR: installed Omarchy system did not boot" >&2; exit 1; }
+  sleep 5
+done
+
+[[ $(guest_exec /usr/bin/uname -m) == "aarch64" ]]
+[[ $(guest_exec /usr/bin/hostname) == "$hostname" ]]
+[[ $(guest_exec /usr/bin/findmnt -n -o SOURCE,FSTYPE /) == "/dev/vda3 btrfs" ]]
+[[ $(guest_exec /usr/bin/findmnt -n -o SOURCE,FSTYPE /boot) == "/dev/vda2 ext4" ]]
+[[ $(guest_exec /usr/bin/findmnt -n -o SOURCE,FSTYPE /boot/efi) == "/dev/vda1 vfat" ]]
+net_devices=$(read_guest_net_devices) || { echo "ERROR: installed guest network devices did not become readable" >&2; exit 1; }
+[[ $net_devices == "lo" ]] || { echo "ERROR: installed VM unexpectedly exposes network devices: $net_devices" >&2; exit 1; }
+guest_exec /usr/bin/bash -lc '
+  set -e
+  mapfile -t packages < <(grep -Ev "^($|#)" /usr/share/omarchy-iso/target-packages)
+  pacman -Q "${packages[@]}" >/dev/null
+  while IFS= read -r command_name; do
+    [[ -n $command_name && $command_name != \#* ]] || continue
+    command -v "$command_name" >/dev/null
+  done </usr/share/omarchy-iso/required-runtime-commands
+'
+guest_exec /usr/bin/ttfx --version >/dev/null
+guest_exec /usr/bin/voxtype --version >/dev/null
+[[ $(guest_exec /usr/bin/sha256sum /usr/share/voxtype/models/ggml-base.en.bin | awk '{print $1}') == "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002" ]]
+guest_exec /usr/bin/test -L "/home/$username/.local/share/voxtype/models/ggml-base.en.bin"
+guest_exec /usr/bin/test -s "/home/$username/.config/voxtype/config.toml"
+guest_exec /usr/bin/bash -lc "id -nG '$username' | tr ' ' '\n' | grep -Fxq input"
+guest_exec /usr/bin/systemctl is-enabled sddm.service qemu-guest-agent.service >/dev/null
+guest_exec /usr/bin/systemctl is-active sddm.service qemu-guest-agent.service >/dev/null
+if [[ -n $authorized_key ]]; then
+  guest_exec /usr/bin/test -s "/home/$username/.ssh/authorized_keys"
+  [[ $(guest_exec /usr/bin/stat -c '%U:%G:%a' "/home/$username/.ssh") == "$username:$username:700" ]]
+  [[ $(guest_exec /usr/bin/stat -c '%U:%G:%a' "/home/$username/.ssh/authorized_keys") == "$username:$username:600" ]]
+  [[ $(guest_exec /usr/bin/sha256sum "/home/$username/.ssh/authorized_keys" | awk '{print $1}') == "$(shasum -a 256 "$authorized_key" | awk '{print $1}')" ]]
+  guest_exec /usr/bin/systemctl is-enabled sshd.service >/dev/null
+  guest_exec /usr/bin/systemctl is-active sshd.service >/dev/null
+  guest_exec /usr/bin/grep -Fq -- '--dport 22 -j ACCEPT' /etc/ufw/user.rules
+fi
+[[ -z $(guest_exec /usr/bin/systemctl --failed --no-legend --plain) ]] || {
+  echo "ERROR: installed system has failed systemd units" >&2
+  guest_exec /usr/bin/systemctl --failed --no-pager >&2
+  exit 1
+}
+guest_exec /usr/bin/quickshell --private-check-compat
+
+# A silent fixture still runs the complete Whisper inference path: binary,
+# configuration, user model link, model parser, and native AArch64 backend.
+guest_exec /usr/bin/python -c 'import wave; f=wave.open("/tmp/voxtype-silence.wav","wb"); f.setparams((1,2,16000,16000,"NONE","not compressed")); f.writeframes(b"\0\0"*16000); f.close()'
+guest_exec /usr/bin/runuser -u "$username" -- /usr/bin/voxtype transcribe /tmp/voxtype-silence.wav >/dev/null
+if install_log_errors=$(guest_exec /usr/bin/grep -nEi \
+  '(^|[^a-z])(error|failed|failure|permission denied|not found)([^a-z]|$)' \
+  /var/log/omarchy-install.log); then
+  echo "ERROR: installed system log contains error-like output:" >&2
+  printf '%s\n' "$install_log_errors" >&2
+  exit 1
+fi
+guest_exec /usr/bin/test -s /boot/Image
+guest_exec /usr/bin/test -s /boot/initramfs-linux.img
+guest_exec /usr/bin/test -s /boot/efi/EFI/BOOT/BOOTAA64.EFI
+guest_exec /usr/bin/test -s /boot/grub/grub.cfg
+
+echo "Offline ARM installation passed: $vm_name ($vm_id)"
+echo "The VM booted native AArch64 Omarchy with no network device present."

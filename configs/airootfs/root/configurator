@@ -6,6 +6,8 @@
 OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}"
 OMARCHY_RUNTIME_PACKAGE="${OMARCHY_RUNTIME_PACKAGE:-omarchy}"
 OMARCHY_SETTINGS_PACKAGE="${OMARCHY_SETTINGS_PACKAGE:-omarchy-settings}"
+arm_install=false
+[[ $(uname -m) == "aarch64" ]] && arm_install=true
 
 LOGO_PATH="$OMARCHY_PATH/logo.txt"
 
@@ -213,7 +215,9 @@ keyboard_form() {
     clear_logo
     echo
     say "Let's setup your machine..."
-    say --foreground 8 "Press Ctrl+C to prepare this machine for another owner."
+    if ! $arm_install; then
+      say --foreground 8 "Press Ctrl+C to prepare this machine for another owner."
+    fi
     echo
 
     omarchy_prompt_keyboard && status=0 || status=$?
@@ -222,13 +226,14 @@ keyboard_form() {
     # Esc means "back", and nothing precedes the first screen, so re-ask.
     ((status == OMARCHY_FORM_BACK)) && continue
 
-    if ((status == OMARCHY_FORM_SIGNAL)); then
+    if ((status == OMARCHY_FORM_SIGNAL)) && ! $arm_install; then
       if confirm_prepare_for_another_owner; then
         defer_provisioning=true
         return 0
       fi
       continue # declined: back to the keyboard picker
     fi
+    ((status == OMARCHY_FORM_SIGNAL)) && continue
     abort
   done
 
@@ -412,7 +417,9 @@ to_gb() {
 
 # T2 Macs need their own kernel for keyboard/wifi drivers.
 detect_kernel() {
-  if lspci -nn 2>/dev/null | grep -q "106b:180[12]"; then
+  if [[ $(uname -m) == "aarch64" ]]; then
+    echo "linux-aarch64"
+  elif lspci -nn 2>/dev/null | grep -q "106b:180[12]"; then
     echo "linux-t2"
   else
     echo "linux"
@@ -913,6 +920,8 @@ open_partition_tool() {
 # viable paths write the whole disk, so the free-space mode is not offered.
 requires_full_disk_install() {
   local pt_type free_space_b
+
+  $arm_install && return 0
   pt_type=$(lsblk -dno PTTYPE "$disk" 2>/dev/null)
 
   # a) No partition table: disk is empty
@@ -949,6 +958,20 @@ install_mode_form() {
 confirm_disk_overwrite() {
   local mode="encrypted"
   local affirmative confirm_status
+
+  if $arm_install; then
+    clear_logo
+    echo
+    say "Everything on $disk will be overwritten."
+    say "The native ARM image installs an unencrypted system disk."
+    echo
+    if gum confirm --affirmative "Yes, install" --negative "No, change it" "Confirm overwriting ${disk}"; then
+      encrypt_installation=false
+      return 0
+    else
+      return 1
+    fi
+  fi
 
   while true; do
     clear_logo
@@ -1129,22 +1152,34 @@ else
   disk_encryption_config=""
 fi
 
+if $arm_install; then
+  bootloader_name="Grub"
+  config_esp_mount="/boot/efi"
+  config_esp_path="/EFI/BOOT"
+  config_efi_binary="BOOTAA64.EFI"
+else
+  bootloader_name="Limine"
+  config_esp_mount="/boot"
+  config_esp_path="/EFI/limine"
+  config_efi_binary="limine_x64.efi"
+fi
+
 cat <<-_EOF_ >user_configuration.json
 {
     "app_config": null,
     "archinstall-language": "English",
     "auth_config": {},
     "audio_config": { "audio": "pipewire" },
-    "bootloader_config": { "bootloader": "Limine", "uki": false, "removable": false },
+    "bootloader_config": { "bootloader": "$bootloader_name", "uki": false, "removable": $arm_install },
     "custom_commands": [],
     "omarchy_install": {
         "mode": "full_disk",
         "defer_provisioning": $defer_provisioning,
         "target_mount": "/mnt",
         "boot": {
-            "esp_mount": "/boot",
-            "esp_path": "/EFI/limine",
-            "efi_binary": "limine_x64.efi",
+            "esp_mount": "$config_esp_mount",
+            "esp_path": "$config_esp_path",
+            "efi_binary": "$config_efi_binary",
             "enable_fallback": true
         },
         "storage": {
@@ -1163,7 +1198,7 @@ cat <<-_EOF_ >user_configuration.json
                         "flags": [ "boot", "esp" ],
                         "fs_type": "fat32",
                         "mount_options": [],
-                        "mountpoint": "/boot",
+                        "mountpoint": "$config_esp_mount",
                         "obj_id": "ea21d3f2-82bb-49cc-ab5d-6f81ae94e18d",
                         "size": {
                             "sector_size": { "unit": "B", "value": 512 },

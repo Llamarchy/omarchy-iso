@@ -1,0 +1,71 @@
+#!/bin/bash
+
+set -Eeuo pipefail
+trap 'printf "ERROR: end-to-end basic ARM acceptance failed at %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
+
+cache_dir="${LLAMARCHY_ARM_CACHE:-${HOME}/Library/Caches/Llamarchy/utm-arm}"
+acceptance_vm="ArchLinuxARM-basic-green-$(date +%Y%m%d-%H%M%S)"
+builder_args=()
+installer_args=()
+
+usage() {
+  cat <<'USAGE'
+Usage: omarchy-iso-accept-basic-arm-utm [options]
+
+Run the complete basic ARM green path: rebuild the cached ISO in the native
+AArch64 builder, create a fresh zero-network UTM VM, install from the ISO,
+remove the ISO, boot the installed disk, and verify the guest.
+
+Options:
+  --builder-vm NAME      Builder VM name
+  --builder-vm-id UUID   Builder VM UUID
+  --guest-host IPV6      Known builder ULA IPv6 address
+  --cache-dir DIR        Persistent ARM development cache
+  --rebuild              Force a fresh basic ISO build
+  --vm NAME              Fresh acceptance VM name
+  --hostname NAME        Installed hostname
+  --memory MIB           Acceptance guest memory
+  --cpus COUNT           Acceptance guest CPU cores
+  --disk MIB             Acceptance guest disk capacity
+  --timeout SECONDS      End-to-end readiness timeout
+  -h, --help             Show this help
+USAGE
+}
+
+while (($#)); do
+  case $1 in
+    --builder-vm) builder_args+=(--vm "$2"); shift 2 ;;
+    --builder-vm-id) builder_args+=(--vm-id "$2"); shift 2 ;;
+    --guest-host) builder_args+=(--guest-host "$2"); shift 2 ;;
+    --cache-dir) cache_dir="$2"; shift 2 ;;
+    --rebuild) builder_args+=(--rebuild); shift ;;
+    --vm) acceptance_vm="$2"; shift 2 ;;
+    --hostname|--memory|--cpus|--disk|--timeout)
+      installer_args+=("$1" "$2")
+      shift 2
+      ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "ERROR: unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+source_root=$(cd "${BASH_SOURCE[0]%/*}/.." && pwd)
+make_command=("$source_root/bin/omarchy-iso-make-basic-arm-utm" --cache-dir "$cache_dir")
+if (( ${#builder_args[@]} > 0 )); then
+  make_command+=("${builder_args[@]}")
+fi
+"${make_command[@]}"
+
+latest_iso=$(find "$cache_dir/basic-iso/release" -maxdepth 1 -type f -name 'archlinuxarm-basic-*-aarch64.iso' -print | sort | tail -1)
+[[ -s $latest_iso ]] || { echo "ERROR: rebuilt basic ARM ISO is unavailable" >&2; exit 1; }
+
+install_command=(
+  "$source_root/bin/omarchy-iso-install-basic-arm-utm"
+  --cache-dir "$cache_dir"
+  --iso "$latest_iso"
+  --vm "$acceptance_vm"
+)
+if (( ${#installer_args[@]} > 0 )); then
+  install_command+=("${installer_args[@]}")
+fi
+"${install_command[@]}"

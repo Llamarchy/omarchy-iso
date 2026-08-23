@@ -1,0 +1,68 @@
+# Maintainer: Llamarchy <https://github.com/Llamarchy>
+
+_pkgname=quickshell
+pkgname=quickshell-git
+pkgver=0.3.0.r20.g28771c7
+pkgrel=2
+pkgdesc='Flexible toolkit for making desktop shells with QtQuick, rebuilt for the current Arch Linux ARM Qt ABI'
+arch=(aarch64)
+url='https://git.outfoxxed.me/quickshell/quickshell'
+options=(!strip)
+license=('LGPL-3.0-only')
+depends=(
+  qt6-declarative
+  qt6-base
+  jemalloc
+  qt6-svg
+  libpipewire
+  libxcb
+  wayland
+  libdrm
+  mesa
+  cpptrace
+  vulkan-headers
+  polkit
+)
+makedepends=(
+  spirv-tools
+  qt6-shadertools
+  wayland-protocols
+  cli11
+  ninja
+  cmake
+  git
+)
+provides=(quickshell)
+conflicts=(quickshell)
+
+source=(
+  "quickshell::git+$url.git#commit=28771c7c74b42e20afca0b1b63980cb46515537c"
+  quickshell-check.hook
+)
+sha256sums=(
+  SKIP
+  8543e21aeaaa5441b73a679160e7601a957f16c433e8d6bd9257e80bd0e94083
+)
+
+pkgver() {
+  cd quickshell
+  git describe --long --tags --abbrev=7 --exclude='*[a-zA-Z][a-zA-Z]*' |
+    sed -E 's/^[^0-9]*//;s/([^-]*-g)/r\1/;s/-/./g'
+}
+
+build() {
+  cd quickshell
+  cmake -GNinja -B build \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DDISTRIBUTOR='Llamarchy ARM' \
+    -DINSTALL_QML_PREFIX=lib/qt6/qml
+  cmake --build build
+}
+
+package() {
+  install -Dm644 quickshell-check.hook -t "$pkgdir/usr/share/libalpm/hooks"
+  cd quickshell
+  DESTDIR="$pkgdir" cmake --install build
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/quickshell"
+}
